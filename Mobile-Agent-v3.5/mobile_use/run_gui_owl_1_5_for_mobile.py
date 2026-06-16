@@ -13,10 +13,16 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import time
 
 from PIL import Image
+
+# Load .env file (searched upward from this script's directory) BEFORE
+# argparse reads defaults from os.environ.
+from env_loader import load_env_file
+_LOADED_ENV = load_env_file()
 
 from packages import PACKAGES_NAME_DICT, NAME_PACKAGE_DICT
 from utils import (
@@ -31,18 +37,27 @@ from utils import (
 
 
 def parse_args():
-    """Parse command-line arguments."""
+    """Parse command-line arguments.
+
+    Model credentials can also be provided via environment variables:
+      VISION_MODEL_API_KEY, VISION_MODEL_BASE_URL, VISION_MODEL_NAME
+    CLI arguments take precedence over env vars when both are present.
+    """
     parser = argparse.ArgumentParser(description="Mobile-Agent-v3.5")
-    parser.add_argument("--adb_path", type=str, required=True,
-                        help="Path to the ADB binary.")
+    parser.add_argument("--adb_path", type=str,
+                        default=os.environ.get("ADB_PATH"),
+                        help="Path to the ADB binary. Defaults to env ADB_PATH.")
     parser.add_argument("--device", type=str, default=None,
                         help="ADB device serial (optional, for multi-device).")
-    parser.add_argument("--api_key", type=str, required=True,
-                        help="API key for the VLM service.")
-    parser.add_argument("--base_url", type=str, required=True,
-                        help="Base URL for the VLM service.")
-    parser.add_argument("--model", type=str, required=True,
-                        help="Model name for the VLM service.")
+    parser.add_argument("--api_key", type=str,
+                        default=os.environ.get("VISION_MODEL_API_KEY"),
+                        help="API key for the VLM service. Defaults to env VISION_MODEL_API_KEY.")
+    parser.add_argument("--base_url", type=str,
+                        default=os.environ.get("VISION_MODEL_BASE_URL"),
+                        help="Base URL for the VLM service. Defaults to env VISION_MODEL_BASE_URL.")
+    parser.add_argument("--model", type=str,
+                        default=os.environ.get("VISION_MODEL_NAME"),
+                        help="Model name for the VLM service. Defaults to env VISION_MODEL_NAME.")
     parser.add_argument("--instruction", type=str, required=True,
                         help="Task instruction for the agent.")
     parser.add_argument("--add_info", type=str, default="",
@@ -55,7 +70,22 @@ def parse_args():
                         help="Base URL for the app-resolver LLM (defaults to --base_url).")
     parser.add_argument("--app_resolver_model", type=str, default="qwen-plus",
                         help="Model name for the app-resolver LLM.")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validate required model credentials (either via CLI or env)
+    missing = []
+    if not args.adb_path:
+        missing.append("--adb_path (or env ADB_PATH)")
+    if not args.api_key:
+        missing.append("--api_key (or env VISION_MODEL_API_KEY)")
+    if not args.base_url:
+        missing.append("--base_url (or env VISION_MODEL_BASE_URL)")
+    if not args.model:
+        missing.append("--model (or env VISION_MODEL_NAME)")
+    if missing:
+        parser.error("Missing required arguments: " + ", ".join(missing))
+
+    return args
 
 
 def parse_action(output_text):
@@ -146,13 +176,23 @@ def main():
 
     # Initialize ADB
     adb_tools = AdbTools(adb_path=args.adb_path, device=args.device)
+    # 启动时将默认输入法设为 ADB Keyboard（只设一次；type() 内不再切换 IME）
+    adb_tools.ensure_ime()
 
     # Prepare output directories
     instruction = args.instruction
     if args.add_info:
         instruction = f"{instruction} ({args.add_info})"
 
-    task_dir = instruction.replace(" ", "_")[:80]
+    # Build a filesystem-safe directory name from the instruction.
+    # Keep CJK chars, ASCII letters/digits/underscore/hyphen; replace everything
+    # else (quotes, parens, punctuation, ...) with underscores. Collapse runs.
+    safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", instruction)
+    safe = re.sub(r"_+", "_", safe).strip("_")[:50]
+    # Append the device serial so concurrent runs on different devices write to
+    # separate directories instead of overwriting each other's screenshots.
+    device_tag = (args.device or "default").replace(":", "_")
+    task_dir = f"{(safe or 'task')}_{device_tag}"
     anno_dir = task_dir + "_anno"
 
     for d in (task_dir, anno_dir):
@@ -169,7 +209,7 @@ def main():
 
     for step_id in range(args.max_steps):
         print(f"\n{'='*50}")
-        print(f"STEP {step_id}")
+        print(f"[{args.device or 'default'}] STEP {step_id}")
         print(f"{'='*50}")
 
         # 1. Capture screenshot

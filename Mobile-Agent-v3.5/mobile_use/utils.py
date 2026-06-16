@@ -10,6 +10,7 @@ Utility functions for Mobile-Agent-v3.5:
 import json
 import math
 import os
+import shlex
 import subprocess
 import time
 from datetime import datetime
@@ -20,7 +21,8 @@ import numpy as np
 from io import BytesIO
 from openai import OpenAI
 from typing import Any, Optional
-from qwen_vl_utils import smart_resize
+# Note: utils.py defines its own smart_resize() below (line ~244), so we no
+# longer import from qwen_vl_utils to avoid pulling in the heavy torch dependency.
 
 from PIL import Image, ImageDraw
 
@@ -94,15 +96,25 @@ class AdbTools:
         """
         Capture a screenshot from the device and save it to *image_path*.
         Returns True on success, False after exhausting retries.
+
+        Uses Popen with stdout redirected to a file handle instead of shell
+        redirection, so paths containing spaces, quotes or other special
+        characters are handled safely.
         """
-        device_flag = f" -s {self.device}" if self.device else ""
-        cmd = f"{self.adb_path}{device_flag} exec-out screencap -p > {image_path}"
+        adb_cmd = [self.adb_path]
+        if self.device:
+            adb_cmd += ["-s", self.device]
+        adb_cmd += ["exec-out", "screencap", "-p"]
 
         for _ in range(retry_times):
-            subprocess.run(cmd, capture_output=True, text=True, shell=True)
-            if os.path.exists(image_path):
-                self._load_image_info(image_path)
-                return True
+            try:
+                with open(image_path, "wb") as out_f:
+                    subprocess.run(adb_cmd, stdout=out_f, stderr=subprocess.PIPE)
+                if os.path.exists(image_path) and os.path.getsize(image_path) > 0:
+                    self._load_image_info(image_path)
+                    return True
+            except Exception as exc:
+                print(f"[WARN] screencap attempt failed: {exc}")
             time.sleep(0.1)
         return False
 
@@ -133,24 +145,27 @@ class AdbTools:
 
     def type(self, text):
         """
-        Type text via ADB Keyboard (supports CJK and Latin characters).
-        Requires ADB Keyboard to be installed on the device.
-        """
-        escaped_text = text.replace('"', '\\"').replace("'", "\\'")
-        command_sequence = [
-            "shell ime enable com.android.adbkeyboard/.AdbIME",
-            "shell ime set com.android.adbkeyboard/.AdbIME",
-            0.1,  # short delay for IME switch
-            f'shell am broadcast -a ADB_INPUT_TEXT --es msg "{escaped_text}"',
-            0.1,
-            "shell ime disable com.android.adbkeyboard/.AdbIME",
-        ]
+        通过 ADB Keyboard 注入文本（支持中英文、空格、标点等任意字符）。
+        前提：ADB Keyboard 已是默认输入法（程序启动时由 ensure_ime 设置）。
 
-        for item in command_sequence:
-            if isinstance(item, (int, float)):
-                time.sleep(item)
-            else:
-                self._run(item.strip())
+        使用 ADB_INPUT_B64（base64）而非 ADB_INPUT_TEXT：
+        将文本经 utf-8 编码后做 base64，再广播。base64 是纯 ASCII 且不含空格，
+        可彻底避免文本中的【空格】/引号/中文在 adb shell 二次解析时被拆分或损坏
+        ——这正是之前"文案输入失败"的真正根因（文案含空格，ADB_INPUT_TEXT 的
+        msg 参数在设备端被空格拆开，导致注入失败）。
+
+        另外这里【不】切换 IME（ime set 会重置已聚焦输入框的键盘状态，同样会
+        导致注入失败）。
+        """
+        b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        self._run(f'shell am broadcast -a ADB_INPUT_B64 --es msg "{b64}"')
+        time.sleep(0.6)
+
+    def ensure_ime(self):
+        """启动时调用一次：启用并切换默认输入法为 ADB Keyboard。"""
+        self._run("shell ime enable com.android.adbkeyboard/.AdbIME")
+        self._run("shell ime set com.android.adbkeyboard/.AdbIME")
+        time.sleep(0.3)
 
     # -- package management -----------------------------------------------
 
@@ -434,6 +449,9 @@ def pil_to_base64(image):
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 def image_to_base64(image_path):
+    # PIL doesn't understand the "file://" prefix that build_messages adds.
+    if image_path.startswith("file://"):
+        image_path = image_path[len("file://"):]
     dummy_image = Image.open(image_path)
     MIN_PIXELS=3136
     MAX_PIXELS=10035200

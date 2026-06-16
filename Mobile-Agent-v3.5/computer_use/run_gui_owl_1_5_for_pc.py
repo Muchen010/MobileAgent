@@ -16,6 +16,11 @@ import time
 
 from PIL import Image
 
+# Load .env file (searched upward from this script's directory) BEFORE
+# argparse reads defaults from os.environ.
+from env_loader import load_env_file
+_LOADED_ENV = load_env_file()
+
 from utils import (
     ComputerTools,
     StepPopup,
@@ -30,17 +35,27 @@ from utils import (
 
 
 def parse_args():
+    """Parse command-line arguments.
+
+    Model credentials can also be provided via environment variables:
+      VISION_MODEL_API_KEY, VISION_MODEL_BASE_URL, VISION_MODEL_NAME
+    CLI arguments take precedence over env vars when both are present.
+    """
     parser = argparse.ArgumentParser(
         description="Computer-Agent-v3.5: Desktop GUI automation agent"
     )
     parser.add_argument(
         "--api_key",
         type=str,
-        required=True,
-        help="DashScope API key",
+        default=os.environ.get("VISION_MODEL_API_KEY"),
+        help="API key for the VLM service. Defaults to env VISION_MODEL_API_KEY.",
     )
-    parser.add_argument("--base_url", type=str, required=True,
-                        help="Base URL for the VLM service.")
+    parser.add_argument(
+        "--base_url",
+        type=str,
+        default=os.environ.get("VISION_MODEL_BASE_URL"),
+        help="Base URL for the VLM service. Defaults to env VISION_MODEL_BASE_URL.",
+    )
     parser.add_argument(
         "--instruction",
         type=str,
@@ -50,8 +65,8 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        default="",
-        help="Model name for the VLM service",
+        default=os.environ.get("VISION_MODEL_NAME", ""),
+        help="Model name for the VLM service. Defaults to env VISION_MODEL_NAME.",
     )
     parser.add_argument(
         "--add_info",
@@ -65,7 +80,19 @@ def parse_args():
         default=50,
         help="Maximum number of interaction steps (default: 50)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    missing = []
+    if not args.api_key:
+        missing.append("--api_key (or env VISION_MODEL_API_KEY)")
+    if not args.base_url:
+        missing.append("--base_url (or env VISION_MODEL_BASE_URL)")
+    if not args.model:
+        missing.append("--model (or env VISION_MODEL_NAME)")
+    if missing:
+        parser.error("Missing required arguments: " + ", ".join(missing))
+
+    return args
 
 
 def rescale_coordinates(action_parameter, resized_width, resized_height):

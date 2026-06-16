@@ -5,3 +5,8 @@ __pycache__/
 **/screenshot/*
 **/temp/*
 logs/*
+
+# environment / secrets
+.env
+**/.env
+!**/.env.example
